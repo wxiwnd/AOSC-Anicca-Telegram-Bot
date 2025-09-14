@@ -1,0 +1,23 @@
+name = "aosc-anicca-telegram-bot"
+main = "src/index.ts"
+compatibility_date = "2025-09-14"
+
+# KV variables
+# - TELEGRAM_BOT_TOKEN: Your Bot token
+# - TELEGRAM_CHAT_ID:   Group/User which bot will boardcast to
+# - SECRET_KEY:         For trigger to use
+
+[vars]
+FETCH_URL = "https://raw.githubusercontent.com/AOSC-Dev/anicca/main/pkgsupdate.json"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = <YOUR_KV_NAMESPACE_ID>
+
+# Cron Trigger
+[triggers]
+crons = ["*/10 * * * *"]
+
+# Enable Log
+[observability.logs]
+enabled = true
