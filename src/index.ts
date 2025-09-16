@@ -53,8 +53,17 @@ function renderUpdateLines(updates: any[]): string[] {
         const after = htmlEscape(truncate(afterRaw, 200));
         const path = htmlEscape(truncate(pathRaw, 800));
 
-        lines.push(`• <b>${name}</b> <code>${before}</code> → <code>${after}</code>`);
-        if (path) lines.push(`<code>${path}</code>`);
+    lines.push(`<b>${name}</b>`);
+    lines.push(`version: <code>${before}</code> → <code>${after}</code>`);
+    if (path) lines.push(`path: <code>${path}</code>`);
+        // Links: PackageInfo | Changelog (based on package name)
+        const nameForUrl = String(u.name ?? "").trim();
+        if (nameForUrl) {
+            const encoded = encodeURIComponent(nameForUrl);
+            const pkgUrl = `https://packages.aosc.io/packages/${encoded}`;
+            const changelogUrl = `https://packages.aosc.io/changelog/${encoded}`;
+            lines.push(`links: <a href="${pkgUrl}">PackageInfo</a> | <a href="${changelogUrl}">Changelog</a>`);
+        }
     }
     return lines;
 }
@@ -222,7 +231,7 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             // Send a summary header with time and TOTAL updates count
             const tsHdr = new Date().toISOString();
             const remaining = Math.max(0, fresh.length - batch.length);
-            const header = `<b>${htmlEscape(tsHdr)}</b>\nTotal updates: <code>${items.length}</code>\nSent this run: <code>${batch.length}</code>\nRemaining: <code>${remaining}</code>`;
+            const header = `<b>${htmlEscape(tsHdr)}</b>\nSummary:\nTotal: <code>${items.length}</code>\nSent this run: <code>${batch.length}</code>\nRemaining: <code>${remaining}</code>`;
             await sendTelegram(env, header);
             for (let i = 0; i < msgs.length; i++) {
                 try {
