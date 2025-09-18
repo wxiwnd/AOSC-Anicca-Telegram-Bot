@@ -129,6 +129,50 @@ async function saveSigSet(env: Env, set: Set<string>): Promise<number> {
     return arr.length;
 }
 
+// Ordered signature store utilities to preserve recency and trim efficiently
+async function loadSigStore(env: Env): Promise<{ list: string[]; set: Set<string> }> {
+    const raw = (await env.STATE.get(KV_LAST_SIGS)) || "";
+    let list: string[] = [];
+    if (raw) {
+        const trimmed = raw.trim();
+        if (trimmed.startsWith("[")) {
+            try {
+                const arr = JSON.parse(trimmed);
+                if (Array.isArray(arr)) list = arr.filter((x) => typeof x === "string" && x.length > 0);
+            } catch {}
+        } else {
+            list = trimmed.split("\n").filter(Boolean);
+        }
+    }
+    return { list, set: new Set(list) };
+}
+
+async function pushSigAndSave(env: Env, store: { list: string[]; set: Set<string> }, sig: string): Promise<number> {
+    const { list, set } = store;
+    // If exists, move to tail to mark recent
+    const idx = list.indexOf(sig);
+    if (idx >= 0) {
+        list.splice(idx, 1);
+        list.push(sig);
+    } else {
+        list.push(sig);
+        set.add(sig);
+    }
+     // Persist
+     const toSave = store.list || list;
+     await env.STATE.put(KV_LAST_SIGS, JSON.stringify(toSave));
+     return toSave.length;
+}
+
+// Keep only signatures that are still present in the current dataset
+async function reconcileSigStore(env: Env, store: { list: string[]; set: Set<string> }, allowed: Set<string>): Promise<number> {
+    const filtered = (store.list || []).filter((s) => allowed.has(s));
+    store.list = filtered;
+    store.set = new Set(filtered);
+    await env.STATE.put(KV_LAST_SIGS, JSON.stringify(filtered));
+    return filtered.length;
+}
+
 async function getAdminId(env: Env): Promise<string | null> {
     const fromEnv = (env.ADMIN_CHAT_ID || "").trim();
     if (fromEnv) return fromEnv;
@@ -202,23 +246,25 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
         const { raw, items } = data;
         const newHash = hashString(raw);
 
-        const prevSet = await loadSigSet(env);
+        const sigStore = await loadSigStore(env);
+        let prevSet = sigStore.set;
         const makeSig = (u: any) => `${u.name ?? ''}|${u.after ?? ''}|${u.path ?? ''}`;
 
 
         const fresh = force ? items.slice() : items.filter((u) => !prevSet.has(makeSig(u)));
         const batch = fresh.slice(0, MAX_PER_RUN);
+        const allowedSigs = new Set(items.map((u) => makeSig(u)));
 
     if (!force && batch.length === 0) {
-            await env.STATE.put(KV_LAST_HASH, newHash);
-            await env.STATE.put(KV_LAST_TS, String(Date.now()));
-            const ts = new Date().toISOString();
-            const msg = `<b>${htmlEscape(ts)}</b>\nTotal updates: <code>${items.length}</code>\n<i>Nothing New Happened</i>`;
-            await sendTelegram(env, msg);
-            return { changed: false, count: items.length, hash: newHash };
-        }
-
-        // INIT record removed
+            // Prune signatures not in current dataset to avoid unbounded growth
+            await reconcileSigStore(env, sigStore, allowedSigs);
+             await env.STATE.put(KV_LAST_HASH, newHash);
+             await env.STATE.put(KV_LAST_TS, String(Date.now()));
+             const ts = new Date().toISOString();
+             const msg = `<b>${htmlEscape(ts)}</b>\nTotal updates: <code>${items.length}</code>\n<i>Nothing New Happened</i>`;
+             await sendTelegram(env, msg);
+             return { changed: false, count: items.length, hash: newHash };
+         }
 
         // Update STATE
         await env.STATE.put(KV_LAST_HASH, newHash);
@@ -236,9 +282,11 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             for (let i = 0; i < msgs.length; i++) {
                 try {
                     await sendTelegram(env, msgs[i]);
-                    // Only record sig after success
-                    prevSet.add(makeSig(batch[i]));
-                    await saveSigSet(env, prevSet);
+                    // Only record sig after success; will be pruned against current dataset later
+                    const sig = makeSig(batch[i]);
+                    await pushSigAndSave(env, sigStore, sig);
+                    // refresh local set reference in case of trimming
+                    prevSet = sigStore.set;
                 } catch (e) {
                     await recordError(env, "sendUpdate", e);
                     await notifyAdminError(env, "sendUpdate", e);
@@ -259,7 +307,9 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
                 }
                 if (i < msgs.length - 1 && SLEEP_BETWEEN_MS > 0) await sleep(SLEEP_BETWEEN_MS);
             }
-        }
+            // After sending, prune any old signatures not in current dataset
+            await reconcileSigStore(env, sigStore, allowedSigs);
+         }
 
         return { changed: true, count: items.length, hash: newHash, messages: force ? msgs : undefined };
     } catch (e) {
