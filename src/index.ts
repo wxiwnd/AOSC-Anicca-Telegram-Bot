@@ -355,6 +355,8 @@ function parseCommand(text: string, botUsername?: string): { command: string; ar
     return { command: cmd, args, rest };
 }
 
+const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd"]);
+
 export default {
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
         ctx.waitUntil((async () => {
@@ -418,9 +420,17 @@ export default {
                 const text = String(msg?.text || "").trim();
                 const { command, args, rest } = parseCommand(text);
 
-                // Ignore non-admin
-                if (!adminId || !msg || chatType !== "private" || chatId !== String(adminId)) {
+                // Ensure message exists
+                if (!msg) {
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+
+                // Allow commands in PUBLIC_COMMANDS to be triggered by anyone (any chat).
+                // For all other commands, enforce admin-only (private chat + adminId).
+                if (!PUBLIC_COMMANDS.has(command)) {
+                    if (!adminId || chatType !== "private" || chatId !== String(adminId)) {
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
                 }
 
                 const help = "可用命令:\n"
@@ -428,7 +438,8 @@ export default {
                     + "/debug - 顯示狀態\n"
                     + "/send &lt;text&gt; - 發送一則訊息到預設頻道\n"
                     + "/trigger - 立即觸發抓取推送\n"
-                    + "/force - 立即強制全量推送";
+                    + "/force - 立即強制全量推送\n"
+                    + "/findupd &lt;package-name&gt; - 在資料庫中搜尋上游更新";
 
                 if (command === "/start" || command === "/help") {
                     await safeSendTelegram(env, help, chatId);
@@ -477,7 +488,48 @@ export default {
                     await safeSendTelegram(env, "已排程強制執行", chatId);
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
-                await safeSendTelegram(env, "未知命令，輸入 /help 查看用法", chatId);
+                if (command === "/new_member") {
+                    const welcomeMessage = "每个人进来都会啰嗦一下：这个群是贡献者交流群，基本谈工作但偶尔会水，但是注意这里可能会讨论不便公开甚至涉及 NDA 的内容，因此原则上不允许转发此群任何内容";
+                    await safeSendTelegram(env, welcomeMessage, chatId);
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/findupd") {
+                    const query = (rest || args.join(" ") || "").trim();
+                    if (!query) {
+                        await safeSendTelegram(env, "格式: /findupd &lt;package-name&gt; 基于软件包仓库进行上游更新查询（仅列出前五项）", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    try {
+                        const data = await fetchUpdates(env);
+                        if (!data) {
+                            await safeSendTelegram(env, `无法取得资料，请稍后再试。`, chatId);
+                            return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                        }
+                        const items: any[] = data.items || [];
+                        // Find items whose name equals or contains the query (case-insensitive)
+                        const q = query.toLowerCase();
+                        const matched = items.filter((it: any) => String(it.name || "").toLowerCase().includes(q));
+                        if (matched.length === 0) {
+                            await safeSendTelegram(env, `找不到符合 "${htmlEscape(query)}" 的软件包。`, chatId);
+                            return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                        }
+                        // Prepare up to 5 results and format using renderUpdateLines to match channel push
+                        const top = matched.slice(0, 5);
+                        const parts: string[] = [];
+                        parts.push("搜索到以下软件包存在上游更新：");
+                        for (const it of top) {
+                            const rendered = renderUpdateLines([it]).join("\n");
+                            parts.push(rendered);
+                        }
+                        await safeSendTelegram(env, parts.join("\n\n"), chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    } catch (e) {
+                        await recordError(env, "/findupd", e);
+                        await safeSendTelegram(env, `搜寻失败：${htmlEscape(String(e || ""))}`, chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                }
+                await safeSendTelegram(env, "未知命令，输入 /help 查看用法", chatId);
                 return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
             } catch (e) {
                 await recordError(env, "/webhook", e);
