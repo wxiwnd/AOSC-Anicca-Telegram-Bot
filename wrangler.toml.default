@@ -13,6 +13,8 @@ FETCH_URL = "https://raw.githubusercontent.com/AOSC-Dev/anicca/main/pkgsupdate.j
 [[kv_namespaces]]
 binding = "STATE"
 id = <YOUR_KV_NAMESPACE_ID>
+TELEGRAM_CHAT_ID=<>
+ADMIN_CHAT_ID=<>
 
 # Cron Trigger
 [triggers]

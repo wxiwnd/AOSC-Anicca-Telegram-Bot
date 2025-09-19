@@ -13,8 +13,11 @@ const KV_LAST_TS = "last_ts";
 const KV_LAST_SIGS = "last_sigs";
 const KV_ADMIN_CHAT_ID = "ADMIN_CHAT_ID";
 const KV_LAST_ERROR = "last_error"; // JSON: { ts, where, message, stack?, detail? }
+const KV_SUBS_PREFIX = "subs:user:"; // subs:user:<userId> => { [packageLower: string]: true }
 const MAX_PER_RUN = 15;
 const SLEEP_BETWEEN_MS = 250;
+
+type Subscriber = { id: string; name: string };
 
 function hashString(s: string): string {
     // Simple FNV-1a 32-bit
@@ -123,12 +126,6 @@ async function loadSigSet(env: Env): Promise<Set<string>> {
     return new Set(trimmed.split("\n").filter(Boolean));
 }
 
-async function saveSigSet(env: Env, set: Set<string>): Promise<number> {
-    const arr = Array.from(set);
-    await env.STATE.put(KV_LAST_SIGS, JSON.stringify(arr));
-    return arr.length;
-}
-
 // Ordered signature store utilities to preserve recency and trim efficiently
 async function loadSigStore(env: Env): Promise<{ list: string[]; set: Set<string> }> {
     const raw = (await env.STATE.get(KV_LAST_SIGS)) || "";
@@ -171,6 +168,76 @@ async function reconcileSigStore(env: Env, store: { list: string[]; set: Set<str
     store.set = new Set(filtered);
     await env.STATE.put(KV_LAST_SIGS, JSON.stringify(filtered));
     return filtered.length;
+}
+
+// List all user IDs that have subscription records
+async function listSubscriptionUserIds(env: Env): Promise<string[]> {
+    const ids: string[] = [];
+    let cursor: string | undefined = undefined;
+    while (true) {
+        const res: any = await (env.STATE as any).list({ prefix: KV_SUBS_PREFIX, cursor });
+        const keys = Array.isArray(res?.keys) ? res.keys : [];
+        for (const k of keys) {
+            const name = String(k.name || "");
+            if (name.startsWith(KV_SUBS_PREFIX)) {
+                ids.push(name.slice(KV_SUBS_PREFIX.length));
+            }
+        }
+        if (res?.list_complete || !res?.cursor) break;
+        cursor = res.cursor;
+    }
+    return Array.from(new Set(ids));
+}
+
+async function loadUserSubscriptions(env: Env, userId: string): Promise<Record<string, true>> {
+    const raw = await env.STATE.get(KV_SUBS_PREFIX + String(userId));
+    if (!raw) return {};
+    try {
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === "object") return obj as Record<string, true>;
+    } catch {}
+    return {};
+}
+
+async function saveUserSubscriptions(env: Env, userId: string, data: Record<string, true>): Promise<void> {
+    await env.STATE.put(KV_SUBS_PREFIX + String(userId), JSON.stringify(data));
+}
+
+async function addUserSubscription(env: Env, userId: string, pkgLower: string): Promise<{ added: boolean; already: boolean; size: number } > {
+    const data = await loadUserSubscriptions(env, userId);
+    const already = !!data[pkgLower];
+    if (already) {
+        return { added: false, already: true, size: Object.keys(data).length };
+    }
+    data[pkgLower] = true;
+    await saveUserSubscriptions(env, userId, data);
+    return { added: true, already: false, size: Object.keys(data).length };
+}
+
+// Collect subscribers for a package across all users
+async function getSubscribersForPackageAll(env: Env, pkgLower: string): Promise<Subscriber[]> {
+    const userIds = await listSubscriptionUserIds(env);
+    if (userIds.length === 0) return [];
+    const result: Subscriber[] = [];
+    for (const uid of userIds) {
+        try {
+            const subsMap = await loadUserSubscriptions(env, uid);
+            if (subsMap[pkgLower]) {
+                result.push({ id: String(uid), name: "" });
+            }
+        } catch (e) {
+            await recordError(env, "subsCollect", e);
+        }
+    }
+    return result;
+}
+
+async function removeUserSubscription(env: Env, userId: string, pkgLower: string): Promise<{ removed: boolean; size: number } > {
+    const data = await loadUserSubscriptions(env, userId);
+    const existed = !!data[pkgLower];
+    if (existed) delete data[pkgLower];
+    await saveUserSubscriptions(env, userId, data);
+    return { removed: existed, size: Object.keys(data).length };
 }
 
 async function getAdminId(env: Env): Promise<string | null> {
@@ -287,6 +354,21 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
                     await pushSigAndSave(env, sigStore, sig);
                     // refresh local set reference in case of trimming
                     prevSet = sigStore.set;
+
+                    // Subscription notifications via private chat (DM) to subscribers
+                    const pkgName = String(batch[i]?.name || "");
+                    const pkgLower = pkgName.toLowerCase();
+                    if (pkgLower) {
+                        const rendered = renderUpdateLines([batch[i]]).join("\n");
+                        const subs = await getSubscribersForPackageAll(env, pkgLower);
+                        for (const s of subs) {
+                            try {
+                                await sendTelegram(env, rendered, String(s.id));
+                            } catch (e) {
+                                await recordError(env, "subsNotifyDM", e);
+                            }
+                        }
+                    }
                 } catch (e) {
                     await recordError(env, "sendUpdate", e);
                     await notifyAdminError(env, "sendUpdate", e);
@@ -405,7 +487,7 @@ function parseCommand(text: string, botUsername?: string): { command: string; ar
     return { command: cmd, args, rest };
 }
 
-const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd"]);
+const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd", "/subscribe", "/unsubscribe", "/listsub", "/help"]);
 
 export default {
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
@@ -484,12 +566,15 @@ export default {
                 }
 
                 const help = "可用命令:\n"
-                    + "/help - 顯示此說明\n"
-                    + "/debug - 顯示狀態\n"
-                    + "/send &lt;text&gt; - 發送一則訊息到預設頻道\n"
-                    + "/trigger - 立即觸發抓取推送\n"
-                    + "/force - 立即強制全量推送\n"
-                    + "/findupd &lt;package-name&gt; - 在資料庫中搜尋上游更新";
+                    + "/help - 显示此帮助信息\n"
+                    + "/debug - 显示详细 Debug 信息(admin)\n"
+                    + "/send &lt;text&gt; - 发送一则信息到预设频道(admin)\n"
+                    + "/trigger - 立即触发抓取推送(admin)\n"
+                    + "/force - 立即强制全量推送(admin)\n"
+                    + "/findupd &lt;package-name&gt; - 查找可能存在的上游更新\n"
+                    + "/subscribe &lt;package-name[;package2;...]&gt; - 订阅指定软件包更新\n"
+                    + "/unsubscribe &lt;package-name&gt; - 取消订阅指定软件包\n"
+                    + "/listsub [package-name] - 列出我的订阅";
 
                 if (command === "/start" || command === "/help") {
                     await safeSendTelegram(env, help, chatId);
@@ -525,22 +610,135 @@ export default {
                         return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                     }
                     await safeSendTelegram(env, payload);
-                    await safeSendTelegram(env, "已發送。", chatId);
+                    await safeSendTelegram(env, "已发送。", chatId);
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
                 if (command === "/trigger") {
                     ctx.waitUntil(processAndNotify(env));
-                    await safeSendTelegram(env, "已排程執行", chatId);
+                    await safeSendTelegram(env, "已排程执行", chatId);
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
                 if (command === "/force") {
                     ctx.waitUntil(processAndNotify(env, true));
-                    await safeSendTelegram(env, "已排程強制執行", chatId);
+                    await safeSendTelegram(env, "已排程强制执行", chatId);
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
                 if (command === "/new_member") {
                     const welcomeMessage = "每个人进来都会啰嗦一下：这个群是贡献者交流群，基本谈工作但偶尔会水，但是注意这里可能会讨论不便公开甚至涉及 NDA 的内容，因此原则上不允许转发此群任何内容";
                     await safeSendTelegram(env, welcomeMessage, chatId);
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/subscribe") {
+                    if (chatType !== "private") {
+                        await safeSendTelegram(env, "请在与机器人的私聊中使用 /subscribe", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    const raw = (rest || args.join(" ") || "").trim();
+                    if (!raw) {
+                        await safeSendTelegram(env, "格式: /subscribe <package1;package2;...>", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    // Split by half/full-width semicolons
+                    const parts = raw.split(/[;；]/).map(s => s.trim()).filter(Boolean);
+                    const uniqueLowers: string[] = [];
+                    const seen = new Set<string>();
+                    for (const p of parts) {
+                        const pl = p.toLowerCase();
+                        if (!seen.has(pl)) { seen.add(pl); uniqueLowers.push(pl); }
+                    }
+                    if (uniqueLowers.length === 0) {
+                        await safeSendTelegram(env, "未提供有效的包名。", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    // Validate existence against current dataset
+                    const updates = await fetchUpdates(env);
+                    if (!updates) {
+                        await safeSendTelegram(env, "出现问题，请稍后再试", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    const nameSet = new Set<string>((updates.items || []).map((it: any) => String(it.name || "").toLowerCase()).filter(Boolean));
+                    const valids: string[] = [];
+                    const invalids: string[] = [];
+                    for (const pl of uniqueLowers) {
+                        if (nameSet.has(pl)) valids.push(pl); else invalids.push(pl);
+                    }
+                    const userId = String(msg?.from?.id || "");
+                    let added = 0, already = 0;
+                    for (const v of valids) {
+                        try {
+                            const res = await addUserSubscription(env, userId, v);
+                            if (res.added) added++; else if (res.already) already++;
+                        } catch (e) {
+                            await recordError(env, "subscribe.add", e);
+                        }
+                    }
+                    const lines: string[] = [];
+                    lines.push(`订阅结果：`);
+                    if (valids.length > 0) {
+                        lines.push(`有效包(${valids.length}): ` + valids.map(x => `<code>${htmlEscape(x)}</code>`).join(", "));
+                        lines.push(`新增 ${added} | 已存在 ${already}`);
+                    }
+                    if (invalids.length > 0) {
+                        lines.push(`未找到下列软件包：`);
+                        lines.push(invalids.map(x => `<code>${htmlEscape(x)}</code>`).join(", "));
+                    }
+                    await safeSendTelegram(env, lines.join("\n"), chatId);
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/unsubscribe") {
+                    if (chatType !== "private") {
+                        await safeSendTelegram(env, "请在与机器人的私聊中使用 /unsubscribe", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    const query = (rest || args.join(" ") || "").trim();
+                    if (!query) {
+                        await safeSendTelegram(env, "格式: /unsubscribe <package-name>", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    const pkgLower = query.toLowerCase();
+                    const userId = String(msg?.from?.id || "");
+                    try {
+                        const resRem = await removeUserSubscription(env, userId, pkgLower);
+                        if (resRem.removed) {
+                            await safeSendTelegram(env, `已取消订阅: <code>${htmlEscape(query)}</code>`, chatId);
+                        } else {
+                            await safeSendTelegram(env, `未找到您的订阅: <code>${htmlEscape(query)}</code>`, chatId);
+                        }
+                    } catch (e) {
+                        await recordError(env, "/unsubscribe", e);
+                        await safeSendTelegram(env, `取消订阅失败：${htmlEscape(String(e || ""))}`, chatId);
+                    }
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/listsub") {
+                    if (chatType !== "private") {
+                        await safeSendTelegram(env, "请在与机器人的私聊中使用 /listsub", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    const query = (rest || args.join(" ") || "").trim().toLowerCase();
+                    try {
+                        const userId = String(msg?.from?.id || "");
+                        const data = await loadUserSubscriptions(env, userId);
+                        const keys = Object.keys(data).sort();
+                        if (keys.length === 0) {
+                            await safeSendTelegram(env, "你目前没有任何订阅。", chatId);
+                            return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                        }
+                        const filter = query || "";
+                        const selected = filter ? keys.filter((k) => k.includes(filter)) : keys;
+                        if (selected.length === 0) {
+                            await safeSendTelegram(env, `未找到符合 <code>${htmlEscape(filter)}</code> 的订阅。`, chatId);
+                            return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                        }
+                        const lines: string[] = ["你的订阅："]; 
+                        for (const k of selected) {
+                            lines.push(`- <code>${htmlEscape(k)}</code>`);
+                        }
+                        await safeSendTelegram(env, lines.join("\n"), chatId);
+                    } catch (e) {
+                        await recordError(env, "/listsub", e);
+                        await safeSendTelegram(env, `列出订阅失败：${htmlEscape(String(e || ""))}`, chatId);
+                    }
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
                 if (command === "/findupd") {
