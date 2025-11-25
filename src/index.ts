@@ -15,14 +15,19 @@ const KV_ADMIN_CHAT_ID = "ADMIN_CHAT_ID";
 const KV_LAST_ERROR = "last_error"; // JSON: { ts, where, message, stack?, detail? }
 const KV_SUBS_PREFIX = "subs:user:"; // subs:user:<userId> => { [packageLower: string]: true }
 const KV_PROCESSING_LOCK = "processing_lock";
+const KV_SUBS_QUEUE = "subs_queue";
 const MAX_PER_RUN = 15;
 const SLEEP_BETWEEN_MS = 250;
 const PROCESSING_LOCK_TTL_SECONDS = 240;
 const PROCESSING_LOCK_MAX_RETRIES = 3;
 const PROCESSING_LOCK_RETRY_BASE_DELAY_MS = 500;
+const SUB_QUEUE_MAX_PER_RUN = 10;
+const SUB_QUEUE_SLEEP_MS = 400;
+const SUB_QUEUE_RETRY_LIMIT = 3;
 
 type Subscriber = { id: string; name: string };
 type SigEntry = { name: string; after: string; path: string };
+type SubQueueItem = { chatId: string; text: string; enqueuedAt: number; attempts?: number };
 
 function toSigEntry(u: any): SigEntry {
     return {
@@ -313,6 +318,83 @@ async function reconcileSigStore(env: Env, store: { list: SigEntry[]; set: Set<s
     return filtered.length;
 }
 
+function normalizeSubQueueItem(raw: any): SubQueueItem | null {
+    if (!raw || typeof raw !== "object") return null;
+    const chatId = String(raw.chatId ?? "").trim();
+    const text = typeof raw.text === "string" ? raw.text : "";
+    if (!chatId || !text) return null;
+    const attempts = Number(raw.attempts ?? 0) || 0;
+    const enqueuedAtRaw = Number(raw.enqueuedAt ?? Date.now());
+    const enqueuedAt = Number.isFinite(enqueuedAtRaw) ? enqueuedAtRaw : Date.now();
+    return { chatId, text, attempts, enqueuedAt };
+}
+
+async function loadSubQueue(env: Env): Promise<SubQueueItem[]> {
+    const raw = await env.STATE.get(KV_SUBS_QUEUE);
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+            const out: SubQueueItem[] = [];
+            for (const item of parsed) {
+                const normalized = normalizeSubQueueItem(item);
+                if (normalized) out.push(normalized);
+            }
+            return out;
+        }
+    } catch (e) {
+        console.warn("loadSubQueue: parse error", e);
+    }
+    return [];
+}
+
+async function saveSubQueue(env: Env, queue: SubQueueItem[]): Promise<void> {
+    if (!queue || queue.length === 0) {
+        await env.STATE.delete(KV_SUBS_QUEUE);
+        return;
+    }
+    await env.STATE.put(KV_SUBS_QUEUE, JSON.stringify(queue));
+}
+
+async function enqueueSubscriptionMessages(env: Env, items: SubQueueItem[]): Promise<number> {
+    if (!items || items.length === 0) return (await loadSubQueue(env)).length;
+    const queue = await loadSubQueue(env);
+    queue.push(...items);
+    await saveSubQueue(env, queue);
+    return queue.length;
+}
+
+async function drainSubscriptionQueue(env: Env): Promise<{ processed: number; remaining: number }> {
+    try {
+        const queue = await loadSubQueue(env);
+        if (queue.length === 0) return { processed: 0, remaining: 0 };
+        const batch = queue.slice(0, SUB_QUEUE_MAX_PER_RUN);
+        const rest = queue.slice(batch.length);
+        let processed = 0;
+        for (let i = 0; i < batch.length; i++) {
+            const item = batch[i];
+            try {
+                await sendTelegram(env, item.text, item.chatId);
+                processed++;
+            } catch (e) {
+                await recordError(env, "subsQueueSend", e);
+                const attempts = (item.attempts ?? 0) + 1;
+                if (attempts <= SUB_QUEUE_RETRY_LIMIT) {
+                    rest.push({ ...item, attempts });
+                }
+            }
+            if (i < batch.length - 1 && SUB_QUEUE_SLEEP_MS > 0) {
+                await sleep(SUB_QUEUE_SLEEP_MS);
+            }
+        }
+        await saveSubQueue(env, rest);
+        return { processed, remaining: rest.length };
+    } catch (e) {
+        await recordError(env, "drainSubscriptionQueue", e);
+        return { processed: 0, remaining: 0 };
+    }
+}
+
 // List all user IDs that have subscription records
 async function listSubscriptionUserIds(env: Env): Promise<string[]> {
     const ids: string[] = [];
@@ -499,6 +581,7 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
         await env.STATE.put(KV_LAST_TS, String(Date.now()));
 
         const msgs = batch.map((u) => renderUpdateLines([u]).join("\n"));
+        const subscriberQueue: SubQueueItem[] = [];
         if (msgs.length === 0) {
             await sendTelegram(env, "Nothing but void.");
         } else {
@@ -517,18 +600,15 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
                     // refresh local set reference in case of trimming
                     prevSet = sigStore.set;
 
-                    // Subscription notifications via private chat (DM) to subscribers
+                    // Queue subscription notifications instead of sending immediately
                     const pkgName = String(batch[i]?.name || "");
                     const pkgLower = pkgName.toLowerCase();
                     if (pkgLower) {
                         const rendered = renderUpdateLines([batch[i]]).join("\n");
                         const subs = await getSubscribersForPackageAll(env, pkgLower);
+                        const enqueueTs = Date.now();
                         for (const s of subs) {
-                            try {
-                                await sendTelegram(env, rendered, String(s.id));
-                            } catch (e) {
-                                await recordError(env, "subsNotifyDM", e);
-                            }
+                            subscriberQueue.push({ chatId: String(s.id), text: rendered, enqueuedAt: enqueueTs });
                         }
                     }
                 } catch (e) {
@@ -553,6 +633,10 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             }
             // After sending, prune any old signatures not in current dataset
             await reconcileSigStore(env, sigStore, allowedSigs);
+
+            if (subscriberQueue.length > 0) {
+                await enqueueSubscriptionMessages(env, subscriberQueue);
+            }
         }
 
         return { changed: true, count: totalCount, hash: newHash, messages: force ? msgs : undefined, duplicatesRemoved: duplicateCount };
@@ -561,6 +645,7 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
         await notifyAdminError(env, "processAndNotify", e);
         return { changed: false, count: 0 };
     } finally {
+        await drainSubscriptionQueue(env);
         await releaseProcessingLock(env, lockToken);
     }
 }
