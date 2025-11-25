@@ -14,10 +14,116 @@ const KV_LAST_SIGS = "last_sigs";
 const KV_ADMIN_CHAT_ID = "ADMIN_CHAT_ID";
 const KV_LAST_ERROR = "last_error"; // JSON: { ts, where, message, stack?, detail? }
 const KV_SUBS_PREFIX = "subs:user:"; // subs:user:<userId> => { [packageLower: string]: true }
+const KV_PROCESSING_LOCK = "processing_lock";
 const MAX_PER_RUN = 15;
 const SLEEP_BETWEEN_MS = 250;
+const PROCESSING_LOCK_TTL_SECONDS = 240;
+const PROCESSING_LOCK_MAX_RETRIES = 3;
+const PROCESSING_LOCK_RETRY_BASE_DELAY_MS = 500;
 
 type Subscriber = { id: string; name: string };
+type SigEntry = { name: string; after: string; path: string };
+
+function toSigEntry(u: any): SigEntry {
+    return {
+        name: String(u?.name ?? ""),
+        after: String(u?.after ?? ""),
+        path: String(u?.path ?? ""),
+    };
+}
+
+function sigEntryKey(entry: SigEntry): string {
+    return `${entry.name}\u0000${entry.after}\u0000${entry.path}`;
+}
+
+function sigEntryKeyFromUpdate(u: any): string {
+    return sigEntryKey(toSigEntry(u));
+}
+
+function parseLegacySigString(raw: string): SigEntry | null {
+    if (!raw) return null;
+    const parts = raw.split("|");
+    if (parts.length === 0) return null;
+    const name = parts.shift() ?? "";
+    const after = parts.shift() ?? "";
+    const path = parts.join("|");
+    return { name, after, path };
+}
+
+function coerceSigEntry(input: any): SigEntry | null {
+    if (!input && input !== "") return null;
+    if (typeof input === "string") return parseLegacySigString(input);
+    if (typeof input === "object") {
+        const name = typeof input.name === "string" ? input.name : "";
+        const after = typeof input.after === "string" ? input.after : "";
+        const path = typeof input.path === "string" ? input.path : "";
+        return { name, after, path };
+    }
+    return null;
+}
+
+function createLockToken(): string {
+    if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.randomUUID === "function") {
+        return globalThis.crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function acquireProcessingLock(env: Env, ttlSeconds: number): Promise<string | null> {
+    const now = Date.now();
+    try {
+        const existingRaw = await env.STATE.get(KV_PROCESSING_LOCK);
+        if (existingRaw) {
+            try {
+                const existing = JSON.parse(existingRaw);
+                const lastTs = Number(existing?.ts) || 0;
+                if (lastTs && now - lastTs < ttlSeconds * 1000) {
+                    console.warn("acquireProcessingLock: existing fresh lock detected");
+                    return null;
+                }
+            } catch (err) {
+                console.warn("acquireProcessingLock: stale lock entry parse error", err);
+            }
+        }
+        const token = createLockToken();
+        const payload = JSON.stringify({ token, ts: now });
+        await env.STATE.put(KV_PROCESSING_LOCK, payload, { expirationTtl: ttlSeconds });
+
+        const maxAttempts = 4;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const confirmRaw = await env.STATE.get(KV_PROCESSING_LOCK);
+            if (confirmRaw) {
+                try {
+                    const confirm = JSON.parse(confirmRaw);
+                    if (confirm?.token === token) return token;
+                } catch (err) {
+                    console.warn("acquireProcessingLock: confirmation parse error", err);
+                }
+            }
+            if (attempt < maxAttempts - 1) await sleep(150 * (attempt + 1));
+        }
+        console.warn("acquireProcessingLock: failed to confirm lock write");
+    } catch (e) {
+        console.error("acquireProcessingLock failed", e);
+    }
+    return null;
+}
+
+async function releaseProcessingLock(env: Env, token: string): Promise<void> {
+    try {
+        const raw = await env.STATE.get(KV_PROCESSING_LOCK);
+        if (!raw) return;
+        try {
+            const data = JSON.parse(raw);
+            if (data?.token !== token) return;
+        } catch {
+            return;
+        }
+        await env.STATE.delete(KV_PROCESSING_LOCK);
+    } catch (e) {
+        console.error("releaseProcessingLock failed", e);
+    }
+}
 
 function hashString(s: string): string {
     // Simple FNV-1a 32-bit
@@ -40,6 +146,41 @@ function truncate(s: string, max: number): string {
     if (!s) return s;
     if (s.length <= max) return s;
     return s.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+function makeUpdateSignature(u: any): string {
+    const name = String(u?.name ?? "");
+    const after = String(u?.after ?? "");
+    const path = String(u?.path ?? "");
+    return `${name}|${after}|${path}`;
+}
+
+function dedupeUpdates(items: any[]): { list: any[]; dropped: number } {
+    if (!Array.isArray(items) || items.length <= 1) {
+        return { list: items || [], dropped: 0 };
+    }
+    const seen = new Set<string>();
+    const result: any[] = [];
+    for (const it of items) {
+        const sig = sigEntryKeyFromUpdate(it);
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        result.push(it);
+    }
+    return { list: result, dropped: items.length - result.length };
+}
+
+async function forceUpdateDatabase(env: Env): Promise<{ total: number; unique: number; duplicatesRemoved: number; hash: string }> {
+    const data = await fetchUpdates(env);
+    if (!data) throw new Error("failed to fetch updates");
+    const { raw, items } = data;
+    const { list: uniqueItems, dropped } = dedupeUpdates(items);
+    const entries = uniqueItems.map((item) => toSigEntry(item));
+    const hash = hashString(raw);
+    await env.STATE.put(KV_LAST_SIGS, JSON.stringify(entries));
+    await env.STATE.put(KV_LAST_HASH, hash);
+    await env.STATE.put(KV_LAST_TS, String(Date.now()));
+    return { total: items.length, unique: entries.length, duplicatesRemoved: dropped, hash };
 }
 
 function renderUpdateLines(updates: any[]): string[] {
@@ -113,59 +254,61 @@ async function notifyAdminError(env: Env, where: string, err: any): Promise<void
 }
 
 async function loadSigSet(env: Env): Promise<Set<string>> {
-    const raw = (await env.STATE.get(KV_LAST_SIGS)) || "";
-    if (!raw) return new Set();
-    const trimmed = raw.trim();
-    if (trimmed.startsWith("[")) {
-        try {
-            const arr = JSON.parse(trimmed);
-            if (Array.isArray(arr)) return new Set(arr.filter((x) => typeof x === "string" && x.length > 0));
-        } catch {}
-        return new Set();
-    }
-    return new Set(trimmed.split("\n").filter(Boolean));
+    const store = await loadSigStore(env);
+    return new Set(store.set);
 }
 
 // Ordered signature store utilities to preserve recency and trim efficiently
-async function loadSigStore(env: Env): Promise<{ list: string[]; set: Set<string> }> {
+async function loadSigStore(env: Env): Promise<{ list: SigEntry[]; set: Set<string> }> {
     const raw = (await env.STATE.get(KV_LAST_SIGS)) || "";
-    let list: string[] = [];
+    const list: SigEntry[] = [];
     if (raw) {
         const trimmed = raw.trim();
         if (trimmed.startsWith("[")) {
             try {
                 const arr = JSON.parse(trimmed);
-                if (Array.isArray(arr)) list = arr.filter((x) => typeof x === "string" && x.length > 0);
-            } catch {}
+                if (Array.isArray(arr)) {
+                    for (const item of arr) {
+                        const coerced = coerceSigEntry(item);
+                        if (coerced) list.push(coerced);
+                    }
+                }
+            } catch {
+                // ignore and fallback to empty list
+            }
         } else {
-            list = trimmed.split("\n").filter(Boolean);
+            const lines = trimmed.split("\n").filter(Boolean);
+            for (const line of lines) {
+                const parsed = parseLegacySigString(line);
+                if (parsed) list.push(parsed);
+            }
         }
     }
-    return { list, set: new Set(list) };
+    return { list, set: new Set(list.map((entry) => sigEntryKey(entry))) };
 }
 
-async function pushSigAndSave(env: Env, store: { list: string[]; set: Set<string> }, sig: string): Promise<number> {
+async function pushSigAndSave(env: Env, store: { list: SigEntry[]; set: Set<string> }, entry: SigEntry): Promise<number> {
     const { list, set } = store;
-    // If exists, move to tail to mark recent
-    const idx = list.indexOf(sig);
-    if (idx >= 0) {
-        list.splice(idx, 1);
-        list.push(sig);
+    const key = sigEntryKey(entry);
+    if (set.has(key)) {
+        const idx = list.findIndex((it) => sigEntryKey(it) === key);
+        if (idx >= 0) {
+            list.splice(idx, 1);
+        }
+        list.push(entry);
     } else {
-        list.push(sig);
-        set.add(sig);
+        list.push(entry);
+        set.add(key);
     }
-     // Persist
-     const toSave = store.list || list;
-     await env.STATE.put(KV_LAST_SIGS, JSON.stringify(toSave));
-     return toSave.length;
+    await env.STATE.put(KV_LAST_SIGS, JSON.stringify(list));
+    return list.length;
 }
 
 // Keep only signatures that are still present in the current dataset
-async function reconcileSigStore(env: Env, store: { list: string[]; set: Set<string> }, allowed: Set<string>): Promise<number> {
-    const filtered = (store.list || []).filter((s) => allowed.has(s));
+async function reconcileSigStore(env: Env, store: { list: SigEntry[]; set: Set<string> }, allowed: Set<string>): Promise<number> {
+    const filtered = (store.list || []).filter((entry) => allowed.has(sigEntryKey(entry)));
     store.list = filtered;
-    store.set = new Set(filtered);
+    store.set = new Set(filtered.map((entry) => sigEntryKey(entry)));
     await env.STATE.put(KV_LAST_SIGS, JSON.stringify(filtered));
     return filtered.length;
 }
@@ -278,8 +421,8 @@ async function sendTelegram(env: Env, text: string, chatIdOverride?: string) {
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     const payload = { chat_id: targetChat, text, parse_mode: "HTML", disable_web_page_preview: true };
     const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const body = await res.text().catch(() => "");
     if (!res.ok) {
-        const body = await res.text();
         throw new Error(`Telegram API ERROR: ${res.status}: ${body}`);
     }
 }
@@ -295,7 +438,12 @@ async function safeSendTelegram(env: Env, text: string, chatIdOverride?: string)
 async function fetchUpdates(env: Env): Promise<{ raw: string; items: any[] } | null> {
     const url = env.FETCH_URL || DEFAULT_URL;
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) {
+        try {
+            await res.text();
+        } catch {}
+        return null;
+    }
     const raw = await res.text();
     try {
         const items = JSON.parse(raw);
@@ -306,32 +454,45 @@ async function fetchUpdates(env: Env): Promise<{ raw: string; items: any[] } | n
     }
 }
 
-async function processAndNotify(env: Env, force = false): Promise<{ changed: boolean; count: number; hash?: string; messages?: string[] }> {
+async function processAndNotify(env: Env, force = false): Promise<{ changed: boolean; count: number; hash?: string; messages?: string[]; skipped?: boolean; reason?: string; duplicatesRemoved?: number }> {
+    let lockToken: string | null = null;
+    for (let attempt = 0; attempt < PROCESSING_LOCK_MAX_RETRIES; attempt++) {
+        lockToken = await acquireProcessingLock(env, PROCESSING_LOCK_TTL_SECONDS);
+        if (lockToken) break;
+        if (attempt < PROCESSING_LOCK_MAX_RETRIES - 1) {
+            await sleep(PROCESSING_LOCK_RETRY_BASE_DELAY_MS * (attempt + 1));
+        }
+    }
+    if (!lockToken) {
+        console.warn("processAndNotify: failed to acquire lock after retries");
+        return { changed: false, count: 0, skipped: true, reason: "locked" };
+    }
     try {
         const data = await fetchUpdates(env);
         if (!data) return { changed: false, count: 0 };
         const { raw, items } = data;
+        const { list: uniqueItems, dropped: duplicateCount } = dedupeUpdates(items);
         const newHash = hashString(raw);
 
-        const sigStore = await loadSigStore(env);
-        let prevSet = sigStore.set;
-        const makeSig = (u: any) => `${u.name ?? ''}|${u.after ?? ''}|${u.path ?? ''}`;
+    const sigStore = await loadSigStore(env);
+    let prevSet = sigStore.set;
 
+    const fresh = force ? uniqueItems.slice() : uniqueItems.filter((u) => !prevSet.has(sigEntryKeyFromUpdate(u)));
+    const batch = fresh.slice(0, MAX_PER_RUN);
+    const allowedSigs = new Set(uniqueItems.map((u) => sigEntryKeyFromUpdate(u)));
+        const totalCount = uniqueItems.length;
 
-        const fresh = force ? items.slice() : items.filter((u) => !prevSet.has(makeSig(u)));
-        const batch = fresh.slice(0, MAX_PER_RUN);
-        const allowedSigs = new Set(items.map((u) => makeSig(u)));
-
-    if (!force && batch.length === 0) {
+        if (!force && batch.length === 0) {
             // Prune signatures not in current dataset to avoid unbounded growth
             await reconcileSigStore(env, sigStore, allowedSigs);
-             await env.STATE.put(KV_LAST_HASH, newHash);
-             await env.STATE.put(KV_LAST_TS, String(Date.now()));
-             const ts = new Date().toISOString();
-             const msg = `<b>${htmlEscape(ts)}</b>\nTotal updates: <code>${items.length}</code>\n<i>Nothing New Happened</i>`;
-             await sendTelegram(env, msg);
-             return { changed: false, count: items.length, hash: newHash };
-         }
+            await env.STATE.put(KV_LAST_HASH, newHash);
+            await env.STATE.put(KV_LAST_TS, String(Date.now()));
+            const ts = new Date().toISOString();
+            const extra = duplicateCount > 0 ? `\nDeduped duplicates: <code>${duplicateCount}</code>` : "";
+            const msg = `<b>${htmlEscape(ts)}</b>\nTotal updates: <code>${totalCount}</code>${extra}\n<i>Nothing New Happened</i>`;
+            await sendTelegram(env, msg);
+            return { changed: false, count: totalCount, hash: newHash, duplicatesRemoved: duplicateCount };
+        }
 
         // Update STATE
         await env.STATE.put(KV_LAST_HASH, newHash);
@@ -344,14 +505,15 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             // Send a summary header with time and TOTAL updates count
             const tsHdr = new Date().toISOString();
             const remaining = Math.max(0, fresh.length - batch.length);
-            const header = `<b>${htmlEscape(tsHdr)}</b>\nSummary:\nTotal: <code>${items.length}</code>\nSent this run: <code>${batch.length}</code>\nRemaining: <code>${remaining}</code>`;
+            const extra = duplicateCount > 0 ? `\nDeduped duplicates: <code>${duplicateCount}</code>` : "";
+            const header = `<b>${htmlEscape(tsHdr)}</b>\nSummary:\nTotal: <code>${totalCount}</code>\nSent this run: <code>${batch.length}</code>\nRemaining: <code>${remaining}</code>${extra}`;
             await sendTelegram(env, header);
             for (let i = 0; i < msgs.length; i++) {
                 try {
                     await sendTelegram(env, msgs[i]);
                     // Only record sig after success; will be pruned against current dataset later
-                    const sig = makeSig(batch[i]);
-                    await pushSigAndSave(env, sigStore, sig);
+                    const entry = toSigEntry(batch[i]);
+                    await pushSigAndSave(env, sigStore, entry);
                     // refresh local set reference in case of trimming
                     prevSet = sigStore.set;
 
@@ -378,8 +540,8 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
                         if (adminId) {
                             const tsNow = new Date().toISOString();
                             const sentSoFar = i;
-                            const remaining = Math.max(0, fresh.length - sentSoFar);
-                            const note = `<b>本輪提前結束</b> @ <b>${htmlEscape(tsNow)}</b>\nSent this run: <code>${sentSoFar}</code>\nRemaining: <code>${remaining}</code>`;
+                            const remainingCount = Math.max(0, fresh.length - sentSoFar);
+                            const note = `<b>本輪提前結束</b> @ <b>${htmlEscape(tsNow)}</b>\nSent this run: <code>${sentSoFar}</code>\nRemaining: <code>${remainingCount}</code>`;
                             await safeSendTelegram(env, note, adminId);
                         }
                     } catch (e2) {
@@ -391,13 +553,15 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             }
             // After sending, prune any old signatures not in current dataset
             await reconcileSigStore(env, sigStore, allowedSigs);
-         }
+        }
 
-        return { changed: true, count: items.length, hash: newHash, messages: force ? msgs : undefined };
+        return { changed: true, count: totalCount, hash: newHash, messages: force ? msgs : undefined, duplicatesRemoved: duplicateCount };
     } catch (e) {
         await recordError(env, "processAndNotify", e);
         await notifyAdminError(env, "processAndNotify", e);
         return { changed: false, count: 0 };
+    } finally {
+        await releaseProcessingLock(env, lockToken);
     }
 }
 
@@ -570,7 +734,7 @@ export default {
                     + "/debug - 显示详细 Debug 信息(admin)\n"
                     + "/send &lt;text&gt; - 发送一则信息到预设频道(admin)\n"
                     + "/trigger - 立即触发抓取推送(admin)\n"
-                    + "/force - 立即强制全量推送(admin)\n"
+                    + "/force_updatedb - 强制将上游版本记录为最新并写入 KV(admin)\n"
                     + "/findupd &lt;package-name&gt; - 查找可能存在的上游更新\n"
                     + "/subscribe &lt;package-name[;package2;...]&gt; - 订阅指定软件包更新\n"
                     + "/unsubscribe &lt;package-name&gt; - 取消订阅指定软件包\n"
@@ -618,9 +782,16 @@ export default {
                     await safeSendTelegram(env, "已排程执行", chatId);
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
-                if (command === "/force") {
-                    ctx.waitUntil(processAndNotify(env, true));
-                    await safeSendTelegram(env, "已排程强制执行", chatId);
+                if (command === "/force_updatedb") {
+                    try {
+                        const info = await forceUpdateDatabase(env);
+                        const extra = info.duplicatesRemoved > 0 ? `\n去重: <code>${info.duplicatesRemoved}</code>` : "";
+                        const body = `<b>已刷新数据库</b>\n总计: <code>${info.total}</code>\n唯一记录: <code>${info.unique}</code>${extra}\nhash: <code>${htmlEscape(info.hash)}</code>`;
+                        await safeSendTelegram(env, body, chatId);
+                    } catch (e) {
+                        await recordError(env, "/force_updatedb", e);
+                        await safeSendTelegram(env, `刷新失败：<code>${htmlEscape(truncate(String(e || ""), 400))}</code>`, chatId);
+                    }
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
                 if (command === "/new_member") {
