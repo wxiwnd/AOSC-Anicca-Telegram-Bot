@@ -16,6 +16,7 @@ const KV_LAST_ERROR = "last_error"; // JSON: { ts, where, message, stack?, detai
 const KV_SUBS_PREFIX = "subs:user:"; // subs:user:<userId> => { [packageLower: string]: true }
 const KV_PROCESSING_LOCK = "processing_lock";
 const KV_SUBS_QUEUE = "subs_queue";
+const KV_REPO_PACKAGE_NAMES = "repo_pkg_names";
 const MAX_PER_RUN = 15;
 const SLEEP_BETWEEN_MS = 250;
 const PROCESSING_LOCK_TTL_SECONDS = 240;
@@ -24,6 +25,9 @@ const PROCESSING_LOCK_RETRY_BASE_DELAY_MS = 500;
 const SUB_QUEUE_MAX_PER_RUN = 10;
 const SUB_QUEUE_SLEEP_MS = 400;
 const SUB_QUEUE_RETRY_LIMIT = 3;
+const REPO_BASE_URL = "https://repo.aosc.io/debs/dists/stable";
+const REPO_PACKAGE_PATHS = ["main/binary-all/Packages", "main/binary-amd64/Packages"];
+const REPO_PKG_LIST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 type Subscriber = { id: string; name: string };
 type SigEntry = { name: string; after: string; path: string };
@@ -437,6 +441,66 @@ async function addUserSubscription(env: Env, userId: string, pkgLower: string): 
     data[pkgLower] = true;
     await saveUserSubscriptions(env, userId, data);
     return { added: true, already: false, size: Object.keys(data).length };
+}
+
+async function loadRepoPackageNameSet(env: Env): Promise<Set<string> | null> {
+    try {
+        const raw = await env.STATE.get(KV_REPO_PACKAGE_NAMES);
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                const updatedAt = Number(parsed?.updatedAt || 0);
+                const now = Date.now();
+                const namesRaw = parsed?.names;
+                if (updatedAt && now - updatedAt <= REPO_PKG_LIST_MAX_AGE_MS && Array.isArray(namesRaw)) {
+                    const s = new Set<string>();
+                    for (const n of namesRaw) {
+                        if (typeof n === "string" && n.trim()) {
+                            s.add(n.trim().toLowerCase());
+                        }
+                    }
+                    if (s.size > 0) return s;
+                }
+            } catch (e) {
+                await recordError(env, "loadRepoPkgNames.parseKV", e);
+            }
+        }
+    } catch (e) {
+        await recordError(env, "loadRepoPkgNames.readKV", e);
+    }
+
+    const names = new Set<string>();
+    for (const rel of REPO_PACKAGE_PATHS) {
+        const url = `${REPO_BASE_URL}/${rel}`;
+        try {
+            const res = await fetch(url);
+            if (!res.ok) continue;
+            const text = await res.text();
+            if (!text) continue;
+            const lines = text.split("\n");
+            for (const line of lines) {
+                if (line.startsWith("Package:")) {
+                    const pkg = line.slice("Package:".length).trim();
+                    if (pkg) names.add(pkg.toLowerCase());
+                }
+            }
+        } catch (e) {
+            await recordError(env, "loadRepoPkgNames.fetch", { url, error: String(e || "") });
+        }
+    }
+    if (names.size === 0) return null;
+
+    try {
+        const payload = JSON.stringify({
+            updatedAt: Date.now(),
+            names: Array.from(names),
+        });
+        await env.STATE.put(KV_REPO_PACKAGE_NAMES, payload);
+    } catch (e) {
+        await recordError(env, "loadRepoPkgNames.saveKV", e);
+    }
+
+    return names;
 }
 
 // Collect subscribers for a package across all users
@@ -906,17 +970,19 @@ export default {
                         await safeSendTelegram(env, "未提供有效的包名。", chatId);
                         return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                     }
-                    // Validate existence against current dataset
-                    const updates = await fetchUpdates(env);
-                    if (!updates) {
-                        await safeSendTelegram(env, "出现问题，请稍后再试", chatId);
-                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
-                    }
-                    const nameSet = new Set<string>((updates.items || []).map((it: any) => String(it.name || "").toLowerCase()).filter(Boolean));
+                    // Validate existence against repository package list if available;
+                    // fall back to accepting all provided names when the list is unavailable.
+                    const repoSet = await loadRepoPackageNameSet(env);
                     const valids: string[] = [];
                     const invalids: string[] = [];
-                    for (const pl of uniqueLowers) {
-                        if (nameSet.has(pl)) valids.push(pl); else invalids.push(pl);
+                    if (repoSet && repoSet.size > 0) {
+                        for (const pl of uniqueLowers) {
+                            if (repoSet.has(pl)) valids.push(pl); else invalids.push(pl);
+                        }
+                    } else {
+                        for (const pl of uniqueLowers) {
+                            valids.push(pl);
+                        }
                     }
                     const userId = String(msg?.from?.id || "");
                     let added = 0, already = 0;
