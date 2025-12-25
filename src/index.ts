@@ -28,6 +28,8 @@ const SUB_QUEUE_RETRY_LIMIT = 3;
 const REPO_BASE_URL = "https://repo.aosc.io/debs/dists/stable";
 const REPO_PACKAGE_PATHS = ["main/binary-all/Packages", "main/binary-amd64/Packages"];
 const REPO_PKG_LIST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const CHECKSUB_SOFT_CHAR_LIMIT = 3500;
+const CHECKSUB_MAX_PACKAGES_PER_MESSAGE = 25;
 
 type Subscriber = { id: string; name: string };
 type SigEntry = { name: string; after: string; path: string };
@@ -800,7 +802,7 @@ function parseCommand(text: string, botUsername?: string): { command: string; ar
     return { command: cmd, args, rest };
 }
 
-const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd", "/subscribe", "/unsubscribe", "/listsub", "/help"]);
+const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd", "/subscribe", "/unsubscribe", "/listsub", "/checksub", "/help"]);
 
 export default {
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
@@ -887,7 +889,8 @@ export default {
                     + "/findupd &lt;package-name&gt; - 查找可能存在的上游更新\n"
                     + "/subscribe &lt;package-name[;package2;...]&gt; - 订阅指定软件包更新\n"
                     + "/unsubscribe &lt;package-name&gt; - 取消订阅指定软件包\n"
-                    + "/listsub [package-name] - 列出我的订阅";
+                    + "/listsub [package-name] - 列出我的订阅\n"
+                    + "/checksub - 查询当前订阅的软件包信息";
 
                 if (command === "/start" || command === "/help") {
                     await safeSendTelegram(env, help, chatId);
@@ -1060,6 +1063,85 @@ export default {
                     } catch (e) {
                         await recordError(env, "/listsub", e);
                         await safeSendTelegram(env, `列出订阅失败：${htmlEscape(String(e || ""))}`, chatId);
+                    }
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/checksub") {
+                    if (chatType !== "private") {
+                        await safeSendTelegram(env, "请在与机器人的私聊中使用 /checksub", chatId);
+                        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                    }
+                    try {
+                        const userId = String(msg?.from?.id || "");
+                        const data = await loadUserSubscriptions(env, userId);
+                        const keys = Object.keys(data).sort();
+                        if (keys.length === 0) {
+                            await safeSendTelegram(env, "你目前没有任何订阅。", chatId);
+                            return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                        }
+                        let updatesByName = new Map<string, any>();
+                        try {
+                            const updates = await fetchUpdates(env);
+                            if (updates && Array.isArray(updates.items)) {
+                                const deduped = dedupeUpdates(updates.items).list;
+                                updatesByName = new Map<string, any>();
+                                for (const u of deduped) {
+                                    const n = String(u?.name || "").toLowerCase();
+                                    if (n) updatesByName.set(n, u);
+                                }
+                            }
+                        } catch (e) {
+                            await recordError(env, "/checksub.fetchUpdates", e);
+                        }
+                        const blocks: string[] = [];
+                        for (const k of keys) {
+                            const lower = k.toLowerCase();
+                            const update = updatesByName.get(lower) || null;
+                            if (update) {
+                                const rendered = renderUpdateLines([update]).join("\n");
+                                blocks.push(rendered);
+                            } else {
+                                const lines: string[] = [];
+                                const displayName = k;
+                                const safeName = htmlEscape(displayName);
+                                lines.push(`<b>${safeName}</b>`);
+                                lines.push("当前暂无上游更新记录。");
+                                const nameForUrl = displayName.trim();
+                                if (nameForUrl) {
+                                    const encoded = encodeURIComponent(nameForUrl);
+                                    const pkgUrl = `https://packages.aosc.io/packages/${encoded}`;
+                                    const changelogUrl = `https://packages.aosc.io/changelog/${encoded}`;
+                                    lines.push(`links: <a href="${pkgUrl}">PackageInfo</a> | <a href="${changelogUrl}">Changelog</a>`);
+                                }
+                                blocks.push(lines.join("\n"));
+                            }
+                        }
+                        const messages: string[] = [];
+                        let current = "你的订阅详情：\n";
+                        let currentCount = 0;
+                        for (const block of blocks) {
+                            const separator = currentCount > 0 ? "\n\n" : "";
+                            if (
+                                current.length + separator.length + block.length > CHECKSUB_SOFT_CHAR_LIMIT ||
+                                currentCount >= CHECKSUB_MAX_PACKAGES_PER_MESSAGE
+                            ) {
+                                messages.push(current);
+                                current = "你的订阅详情：\n" + block;
+                                currentCount = 1;
+                            } else {
+                                current += separator + block;
+                                currentCount++;
+                            }
+                        }
+                        if (current.trim()) {
+                            messages.push(current);
+                        }
+                        for (const m of messages) {
+                            await safeSendTelegram(env, m, chatId);
+                        }
+                    } catch (e) {
+                        await recordError(env, "/checksub", e);
+                        await safeSendTelegram(env, `获取订阅详情失败：${htmlEscape(String(e || ""))}`, chatId);
                     }
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }
