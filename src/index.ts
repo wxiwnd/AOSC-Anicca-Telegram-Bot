@@ -26,6 +26,8 @@ const PROCESSING_LOCK_RETRY_BASE_DELAY_MS = 500;
 const SUB_QUEUE_MAX_PER_RUN = 10;
 const SUB_QUEUE_SLEEP_MS = 400;
 const SUB_QUEUE_RETRY_LIMIT = 3;
+const CHECKSUB_MESSAGE_LIMIT = 3500;
+const CHECKSUB_PACKAGES_PER_MESSAGE = 25;
 const REPO_BASE_URL = "https://repo.aosc.io/debs/dists/stable";
 const REPO_PACKAGE_PATHS = ["main/binary-all/Packages", "main/binary-amd64/Packages"];
 const REPO_PKG_LIST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
@@ -204,8 +206,12 @@ async function forceUpdateDatabase(env: Env): Promise<{ total: number; unique: n
     }
 }
 
+function packageLinks(name: string): string {
+    const encoded = encodeURIComponent(name);
+    return `links: <a href="https://packages.aosc.io/packages/${encoded}">PackageInfo</a> | <a href="https://packages.aosc.io/changelog/${encoded}">Changelog</a>`;
+}
+
 function renderUpdateLines(updates: any[]): string[] {
-    // updates: array of { name, before, after, path, warnings? }
     const lines: string[] = [];
     for (const u of updates) {
         const nameRaw = String(u.name ?? "(unknown)");
@@ -218,17 +224,11 @@ function renderUpdateLines(updates: any[]): string[] {
         const after = htmlEscape(truncate(afterRaw, 200));
         const path = htmlEscape(truncate(pathRaw, 800));
 
-    lines.push(`<b>${name}</b>`);
-    lines.push(`version: <code>${before}</code> → <code>${after}</code>`);
-    if (path) lines.push(`path: <code>${path}</code>`);
-        // Links: PackageInfo | Changelog (based on package name)
+        lines.push(`<b>${name}</b>`);
+        lines.push(`version: <code>${before}</code> → <code>${after}</code>`);
+        if (path) lines.push(`path: <code>${path}</code>`);
         const nameForUrl = String(u.name ?? "").trim();
-        if (nameForUrl) {
-            const encoded = encodeURIComponent(nameForUrl);
-            const pkgUrl = `https://packages.aosc.io/packages/${encoded}`;
-            const changelogUrl = `https://packages.aosc.io/changelog/${encoded}`;
-            lines.push(`links: <a href="${pkgUrl}">PackageInfo</a> | <a href="${changelogUrl}">Changelog</a>`);
-        }
+        if (nameForUrl) lines.push(packageLinks(nameForUrl));
     }
     return lines;
 }
@@ -564,6 +564,12 @@ async function safeSendTelegram(env: Env, text: string, chatIdOverride?: string)
     }
 }
 
+function sendNoUpdates(env: Env, total: number, duplicates: number) {
+    const timestamp = new Date().toISOString();
+    const deduped = duplicates > 0 ? `\nDeduped duplicates: <code>${duplicates}</code>` : "";
+    return sendTelegram(env, `<b>${timestamp}</b>\nTotal updates: <code>${total}</code>${deduped}\n<i>Nothing New Happened</i>`);
+}
+
 async function fetchUpdates(env: Env): Promise<{ raw: string; items: any[] } | null> {
     const url = env.FETCH_URL || DEFAULT_URL;
     const res = await fetch(url);
@@ -581,6 +587,45 @@ async function fetchUpdates(env: Env): Promise<{ raw: string; items: any[] } | n
     } catch {
         return null;
     }
+}
+
+async function sendSubscriptionDetails(env: Env, userId: string, chatId: string): Promise<void> {
+    const subscriptions = await loadUserSubscriptions(env, userId);
+    const names = Object.keys(subscriptions).sort();
+    if (names.length === 0) {
+        await safeSendTelegram(env, "你目前没有任何订阅。", chatId);
+        return;
+    }
+
+    const feed = await fetchUpdates(env);
+    if (!feed) {
+        await safeSendTelegram(env, "无法取得资料，请稍后再试。", chatId);
+        return;
+    }
+    const updates = new Map<string, any>();
+    for (const item of feed.items) {
+        const name = String(item?.name ?? "").toLowerCase();
+        if (Object.hasOwn(subscriptions, name)) updates.set(name, item);
+    }
+
+    const title = "你的订阅详情：\n";
+    let message = title;
+    let count = 0;
+    for (const name of names) {
+        const update = updates.get(name);
+        const block = update
+            ? renderUpdateLines([update]).join("\n")
+            : `<b>${htmlEscape(name)}</b>\n当前暂无上游更新记录。\n${packageLinks(name)}`;
+        if (count > 0 && (message.length + 2 + block.length > CHECKSUB_MESSAGE_LIMIT || count === CHECKSUB_PACKAGES_PER_MESSAGE)) {
+            await safeSendTelegram(env, message, chatId);
+            message = title;
+            count = 0;
+        }
+        if (count > 0) message += "\n\n";
+        message += block;
+        count++;
+    }
+    await safeSendTelegram(env, message, chatId);
 }
 
 async function processAndNotify(env: Env, force = false): Promise<{ changed: boolean; count: number; hash?: string; messages?: string[]; skipped?: boolean; reason?: string; duplicatesRemoved?: number }> {
@@ -601,6 +646,7 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
         };
         if (!loaded.legacy && !hasNew() && loaded.state.queue.length === 0) {
             if (upstreamError) throw upstreamError;
+            if (data && !force) await sendNoUpdates(env, items.length, dropped);
             return { changed: false, count: items.length, hash: data ? hashString(data.raw) : undefined, duplicatesRemoved: dropped };
         }
         for (let attempt = 0; attempt < PROCESSING_LOCK_MAX_RETRIES; attempt++) {
@@ -660,6 +706,7 @@ async function processAndNotify(env: Env, force = false): Promise<{ changed: boo
             await recordError(env, sendError ? "sendUpdate" : "subsQueueSend", error);
             await notifyAdminError(env, sendError ? "sendUpdate" : "subsQueueSend", error);
         }
+        if (data && !force && fresh.length === 0) await sendNoUpdates(env, items.length, dropped);
         return { changed: messages.length > 0, count: items.length, hash: data ? hashString(data.raw) : undefined, messages: force ? messages : undefined, duplicatesRemoved: dropped };
     } catch (e) {
         await recordError(env, "processAndNotify", e);
@@ -756,7 +803,7 @@ function parseCommand(text: string, botUsername?: string): { command: string; ar
     return { command: cmd, args, rest };
 }
 
-const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd", "/subscribe", "/unsubscribe", "/listsub", "/help"]);
+const PUBLIC_COMMANDS = new Set<string>(["/new_member", "/findupd", "/subscribe", "/unsubscribe", "/listsub", "/checksub", "/help"]);
 
 export default {
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
@@ -845,7 +892,8 @@ export default {
                     + "/findupd &lt;package-name&gt; - 查找可能存在的上游更新\n"
                     + "/subscribe &lt;package-name[;package2;...]&gt; - 订阅指定软件包更新\n"
                     + "/unsubscribe &lt;package-name&gt; - 取消订阅指定软件包\n"
-                    + "/listsub [package-name] - 列出我的订阅";
+                    + "/listsub [package-name] - 列出我的订阅\n"
+                    + "/checksub - 查看已订阅软件包的上游更新详情";
 
                 if (command === "/start" || command === "/help") {
                     await safeSendTelegram(env, help, chatId);
@@ -1016,6 +1064,19 @@ export default {
                     } catch (e) {
                         await recordError(env, "/listsub", e);
                         await safeSendTelegram(env, `列出订阅失败：${htmlEscape(String(e || ""))}`, chatId);
+                    }
+                    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+                }
+                if (command === "/checksub") {
+                    if (chatType !== "private") {
+                        await safeSendTelegram(env, "请在与机器人的私聊中使用 /checksub", chatId);
+                    } else {
+                        try {
+                            await sendSubscriptionDetails(env, String(msg?.from?.id || ""), chatId);
+                        } catch (e) {
+                            console.error("/checksub failed", e);
+                            await safeSendTelegram(env, "获取订阅详情失败，请稍后再试。", chatId);
+                        }
                     }
                     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
                 }

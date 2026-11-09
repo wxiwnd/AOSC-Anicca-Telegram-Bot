@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "backup:kv": "node scripts/backup-kv.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240903.0",

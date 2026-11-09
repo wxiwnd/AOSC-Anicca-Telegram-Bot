@@ -3,3 +3,4 @@ wrangler.toml
 .github
 .wrangler
 .vscode
+.backups/

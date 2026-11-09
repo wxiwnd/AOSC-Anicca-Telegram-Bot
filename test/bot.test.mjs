@@ -77,27 +77,91 @@ function harness(t, { rows = [], known = [], users = 0, kvConfig = false, strict
         await bot.scheduled({}, env, { waitUntil: p => pending.push(p) });
         await Promise.all(pending);
     }
-    async function request(path, command, user = 'user') {
+    async function request(path, command, user = 'user', chatType = 'private') {
         now += 600_000;
-        return bot.fetch(new Request(`https://bot.test${path}`, {
+        const pending = [];
+        const response = await bot.fetch(new Request(`https://bot.test${path}`, {
             method: command ? 'POST' : 'GET',
             headers: { Authorization: 'Bearer secret', 'X-Telegram-Bot-Api-Secret-Token': 'secret' },
-            body: command ? JSON.stringify({ message: { text: command, from: { id: user }, chat: { id: user, type: 'private' } } }) : undefined,
-        }), env, { waitUntil() {} });
+            body: command ? JSON.stringify({ message: { text: command, from: { id: user }, chat: { id: user, type: chatType } } }) : undefined,
+        }), env, { waitUntil: p => pending.push(p) });
+        await Promise.all(pending);
+        return response;
     }
     const packages = () => sent.filter(m => m.chat_id === 'channel' && m.text.startsWith('<b>pkg-'));
     const count = (op, key) => calls.filter(([a, b]) => a === op && (key === undefined || b === key)).length;
     return { run, request, db, sent, calls, rejected, fail, packages, count };
 }
 
-test('unchanged snapshots stay quiet and do not write, delete or list KV', async t => {
+test('an unchanged snapshot sends the English status without writing, deleting or listing KV', async t => {
     const h = harness(t, { rows: [update(1)], known: [update(1)] });
     await h.run(); // legacy migration may write once
     h.calls.length = 0; h.sent.length = 0;
     await h.run();
-    assert.equal(h.sent.length, 0);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].chat_id, 'channel');
+    assert.match(h.sent[0].text, /^<b>[^<]+<\/b>\nTotal updates: <code>1<\/code>\n<i>Nothing New Happened<\/i>$/);
     for (const op of ['put', 'delete', 'list']) assert.equal(h.count(op), 0, op);
     assert(h.count('get') <= 2);
+});
+
+test('admin trigger posts the idle status only for a successful check with no new updates', async t => {
+    const h = harness(t, { rows: [update(1), update(1)], known: [update(1)] });
+    await h.run();
+    h.sent.length = 0;
+    await h.request('/webhook', '/trigger', 'admin');
+    assert.deepEqual(h.sent.filter(m => m.chat_id === 'admin').map(m => m.text), ['已排程执行']);
+    assert.deepEqual(h.sent.filter(m => m.chat_id === 'channel').map(m => m.text.split('\n').slice(1).join('\n')), [
+        'Total updates: <code>1</code>\nDeduped duplicates: <code>1</code>\n<i>Nothing New Happened</i>',
+    ]);
+    h.sent.length = 0;
+    await h.run('invalid JSON');
+    assert.equal(h.sent.some(m => m.chat_id === 'channel'), false);
+    await h.run([update(1, '3')]);
+    assert.equal(h.packages().length, 1);
+    assert.equal(h.sent.some(m => m.text.includes('Nothing New Happened')), false);
+});
+
+test('checksub replies privately when there are no subscriptions', async t => {
+    const h = harness(t);
+    await h.request('/webhook', '/checksub');
+    assert.deepEqual(h.sent.map(({chat_id, text}) => [chat_id, text]), [['user', '你目前没有任何订阅。']]);
+    assert.deepEqual(h.calls, [['get', 'subs:user:user']]);
+});
+
+test('checksub shows only the caller’s packages and reports a feed failure', async t => {
+    const h = harness(t, { rows: [update(1), update(3)] });
+    h.db.set('subs:user:user', JSON.stringify({ 'pkg-1': true, 'pkg-2': true }));
+    h.db.set('subs:user:other', JSON.stringify({ 'pkg-3': true }));
+    await h.request('/webhook', '/checksub');
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].chat_id, 'user');
+    assert.match(h.sent[0].text, /<b>pkg-1<\/b>\nversion: <code>1<\/code> → <code>2<\/code>/);
+    assert.match(h.sent[0].text, /<b>pkg-2<\/b>\n当前暂无上游更新记录。/);
+    assert.match(h.sent[0].text, /https:\/\/packages\.aosc\.io\/changelog\/pkg-2/);
+    assert.doesNotMatch(h.sent[0].text, /pkg-3/);
+    assert.deepEqual(h.calls, [['get', 'subs:user:user']]);
+
+    h.fail.upstream = true;
+    await h.request('/webhook', '/checksub');
+    assert.equal(h.sent.at(-1).text, '获取订阅详情失败，请稍后再试。');
+});
+
+test('checksub keeps group replies free of subscription details and splits long private replies', async t => {
+    const h = harness(t);
+    const names = Array.from({ length: 30 }, (_, i) => `package-with-a-long-name-${i}`);
+    h.db.set('subs:user:user', JSON.stringify(Object.fromEntries(names.map(name => [name, true]))));
+    await h.request('/webhook', '/checksub', 'user', 'supergroup');
+    assert.equal(h.sent[0].text, '请在与机器人的私聊中使用 /checksub');
+    assert.deepEqual(h.calls, []);
+
+    h.sent.length = 0;
+    await h.request('/webhook', '/checksub');
+    assert(h.sent.length > 1);
+    assert(h.sent.every(m => m.chat_id === 'user' && m.text.length <= 3500 && m.text.startsWith('你的订阅详情：\n')));
+    const combined = h.sent.map(m => m.text).join('\n');
+    for (const name of names) assert(combined.includes(`<b>${name}</b>`));
+    assert.deepEqual(h.calls, [['get', 'subs:user:user']]);
 });
 
 test('disappearance and empty snapshots never erase already announced versions', async t => {
@@ -312,7 +376,10 @@ for (const [format, encode] of Object.entries(legacyFormats)) {
         h.calls.length = 0;
         await h.run([update(1), update(2), known[1]]);
         assert.equal(h.packages().length, 1);
-        assert.deepEqual(h.calls, [['get', 'notification_state']]);
+        assert.deepEqual(h.calls, [
+            ['get', 'notification_state'],
+            ...[...config.keys()].map(key => ['get', key]),
+        ]);
     });
 }
 
